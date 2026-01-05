@@ -49,7 +49,7 @@ struct Args {
     #[arg(long)]
     readonly: bool,
 
-    /// Custom AWS endpoint URL (for LocalStack, MinIO, etc.). Also reads from AWS_ENDPOINT_URL env var.
+    /// Custom AWS endpoint URL (for LocalStack, etc.). Also reads from AWS_ENDPOINT_URL env var.
     #[arg(long)]
     endpoint_url: Option<String>,
 }
