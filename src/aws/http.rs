@@ -1008,13 +1008,12 @@ pub fn xml_to_json(xml: &str) -> Result<serde_json::Value> {
     use serde_json::{Map, Value};
     fn parse_element(reader: &mut Reader<&[u8]>) -> Result<Value> {
         let mut map: Map<String, Value> = Map::new();
-        let mut buf = Vec::new();
         let mut current_text = String::new();
 
         loop {
-            match reader.read_event_into(&mut buf) {
+            match reader.read_event() {
                 Ok(Event::Start(e)) => {
-                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag_name = e.name().as_ref().to_string();
                     let child_value = parse_element(reader)?;
 
                     // Handle duplicate keys by converting to array
@@ -1030,44 +1029,51 @@ pub fn xml_to_json(xml: &str) -> Result<serde_json::Value> {
                         map.insert(tag_name, child_value);
                     }
                 }
-                Ok(Event::Text(e)) => {
-                    let text = e.xml_content().unwrap_or_default().trim().to_string();
-                    if !text.is_empty() {
-                        current_text = text;
+                // Since quick-xml 0.40 the reader no longer folds entities into the
+                // text run; `&amp;` & friends arrive as their own `GeneralRef` events,
+                // so text has to be accumulated across both and trimmed once at the end.
+                Ok(Event::Text(e)) => current_text.push_str(&e.xml10_content()),
+                Ok(Event::CData(e)) => current_text.push_str(&e.xml10_content()),
+                Ok(Event::GeneralRef(e)) => {
+                    if let Some(ch) = e.resolve_char_ref()? {
+                        current_text.push(ch);
+                    } else if let Some(text) =
+                        quick_xml::escape::resolve_predefined_entity(e.as_ref())
+                    {
+                        current_text.push_str(text);
                     }
+                    // Unknown entities are dropped, matching the pre-0.40 lossy behaviour.
                 }
                 Ok(Event::End(_)) => {
                     break;
                 }
                 Ok(Event::Empty(e)) => {
-                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let tag_name = e.name().as_ref().to_string();
                     map.insert(tag_name, Value::Null);
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => return Err(anyhow!("XML parse error: {}", e)),
                 _ => {}
             }
-            buf.clear();
         }
 
         // If we only collected text and no child elements, return the text
-        if map.is_empty() && !current_text.is_empty() {
-            Ok(Value::String(current_text))
+        let text = current_text.trim();
+        if map.is_empty() && !text.is_empty() {
+            Ok(Value::String(text.to_string()))
         } else {
             Ok(Value::Object(map))
         }
     }
 
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut root_map: Map<String, Value> = Map::new();
-    let mut buf = Vec::new();
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag_name = e.name().as_ref().to_string();
                 let child_value = parse_element(&mut reader)?;
                 root_map.insert(tag_name, child_value);
             }
@@ -1075,7 +1081,6 @@ pub fn xml_to_json(xml: &str) -> Result<serde_json::Value> {
             Ok(_) => {}
             Err(e) => return Err(anyhow!("XML parse error: {}", e)),
         }
-        buf.clear();
     }
 
     Ok(Value::Object(root_map))
@@ -1083,7 +1088,8 @@ pub fn xml_to_json(xml: &str) -> Result<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_service, AwsHttpClient, Credentials};
+    use super::{get_service, xml_to_json, AwsHttpClient, Credentials};
+    use serde_json::json;
 
     fn dummy_credentials() -> Credentials {
         Credentials {
@@ -1148,5 +1154,38 @@ mod tests {
         let service = get_service("cloudfront").expect("cloudfront service definition");
         let endpoint = client.get_endpoint(&service).expect("cloudfront endpoint");
         assert_eq!(endpoint, "https://cloudfront.amazonaws.com");
+    }
+
+    #[test]
+    fn xml_to_json_nests_and_groups_repeated_elements() {
+        let xml = r#"<DescribeInstancesResponse>
+            <reservationSet>
+                <item><instancesSet>
+                    <item><instanceId>i-1</instanceId></item>
+                    <item><instanceId>i-2</instanceId></item>
+                </instancesSet></item>
+            </reservationSet>
+        </DescribeInstancesResponse>"#;
+
+        let json = xml_to_json(xml).expect("valid xml");
+        let instances =
+            &json["DescribeInstancesResponse"]["reservationSet"]["item"]["instancesSet"]["item"];
+        assert_eq!(instances[0]["instanceId"], "i-1");
+        assert_eq!(instances[1]["instanceId"], "i-2");
+    }
+
+    #[test]
+    fn xml_to_json_resolves_entities_in_text() {
+        // Regression: quick-xml >= 0.40 emits entity references as their own events,
+        // so the parser must stitch text + entity runs back together.
+        let xml = "<Tag><Value>a &amp; b &lt;c&gt; &#65;</Value></Tag>";
+        let json = xml_to_json(xml).expect("valid xml");
+        assert_eq!(json["Tag"]["Value"], "a & b <c> A");
+    }
+
+    #[test]
+    fn xml_to_json_maps_empty_elements_to_null() {
+        let json = xml_to_json("<Root><Empty/><Filled>x</Filled></Root>").expect("valid xml");
+        assert_eq!(json["Root"], json!({ "Empty": null, "Filled": "x" }));
     }
 }
